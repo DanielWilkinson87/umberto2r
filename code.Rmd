@@ -1,0 +1,379 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# Weighted Impact Categories per Scenario
+Weight the impact categories for a given dataset and scenario.
+
+```{r message=FALSE, warning=FALSE, error=FALSE}
+library(readxl)
+library(tidyverse)
+library(stringr)
+library(ggthemes)
+library(flextable)
+
+
+# Specify the impact assessment methodology you're using
+methodology_used <- "Environmental Footprint"
+
+# 1. Generalized data processor
+process_data <- function(file_path, sheet_name) {
+  df <- read_excel(file_path, sheet = sheet_name)
+  
+  df <- df %>%
+    mutate(
+      Scenario = factor(Scenario, levels = unique(Scenario)),
+      Indicator = factor(Indicator, levels = unique(Indicator)),
+      Unit = factor(Unit),
+      Quantity = as.numeric(Quantity)
+    )
+  
+  return(df)
+}
+
+# 2. Generalized function to calculate weighted categories
+calculate_weighted_categories <- function(df, mix_scenario, weighted_tag = "\\(W\\)") {
+  df %>%
+    filter(
+      Scenario == mix_scenario,
+      grepl(weighted_tag, Indicator)
+    ) %>%
+    mutate(
+      Indicator = gsub(paste0("\\s*", weighted_tag), "", Indicator),
+      Quantity = as.numeric(Quantity)
+    ) %>%
+    group_by(Indicator) %>%
+    summarise(
+      total_quantity = sum(Quantity, na.rm = TRUE),
+      total_quantity_abs = abs(total_quantity),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(total_quantity_abs)) %>%
+    mutate(
+      cum_sum = cumsum(total_quantity_abs),
+      cum_per = cum_sum / sum(total_quantity_abs),
+      first_above80 = which(cum_per >= 0.8)[1],
+      above80 = ifelse(row_number() <= first_above80, "yes", "no")
+    )
+}
+
+create_hotspot_plot <- function(data, add_title = FALSE, title_scenario = NULL) {
+  # Get min and max bar values
+  min_val <- min(data$total_quantity, na.rm = TRUE)
+  max_val <- max(data$total_quantity, na.rm = TRUE)
+
+  # Pad just beyond bars
+  lower_limit <- min_val - 0.05 * abs(min_val)
+  upper_limit <- max_val + 0.05 * abs(max_val)
+
+  # Use pretty breaks within those limits
+  breaks <- pretty(c(lower_limit, upper_limit), n = 6)
+
+  # Build plot
+  p <- ggplot(data, aes(x = reorder(Indicator, -total_quantity), y = total_quantity, fill = above80)) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = c("yes" = "blue", "no" = "lightgrey")) +
+    labs(
+      x = "Impact Category",
+      y = "Weighted Impact (Points)",
+      fill = "Hotspot"
+    ) +
+    theme_few() +
+    scale_y_continuous(
+      limits = c(min(breaks), max(breaks)),
+      breaks = breaks,
+      expand = c(0, 0)
+    ) +
+    coord_flip() +
+    theme(
+      text = element_text(size = 11),
+      axis.title = element_text(size = 11),
+      axis.text = element_text(size = 11)
+    )
+
+  if (add_title && !is.null(title_scenario)) {
+    p <- p + ggtitle(paste("Most important impact categories\n in", title_scenario))
+  }
+
+  return(p)
+}
+
+
+```
+
+# Test
+
+
+```{r message=FALSE, warning=FALSE, error=FALSE}
+# test 
+
+df <- process_data("EF_2028f.xlsx","LCIA RawData")
+# calculate_weighted_categories <- function(df, mix_scenario, weighted_tag = "\\(W\\)")
+weighted_impacts <- calculate_weighted_categories(df, "100% grid, 2028", weighted_tag = "\\(W\\)")
+
+create_hotspot_plot(data = weighted_impacts, add_title = TRUE,title_scenario ="100% grid, 2028")
+```
+
+Run the code over all scenarios to get graphs for each one. Save each in Figures folder.
+
+```{r}
+
+library(purrr)
+library(tidyverse)
+
+# Get unique scenarios
+scenarios <- unique(df$Scenario)
+
+# Run analysis and plotting for each scenario
+results <- map(scenarios, function(scenario) {
+  # Calculate weighted categories
+  weighted_data <- calculate_weighted_categories(df, scenario)
+  
+  # Create plot
+  plot <- create_hotspot_plot(weighted_data, add_title = TRUE, title_scenario = scenario)
+  
+  # Save plot (sanitize file name)
+  safe_name <- gsub("[^a-zA-Z0-9]", "_", scenario)
+  ggsave(paste0("Figures/hotspot_", safe_name, ".png"), plot = plot, bg = "white")
+  
+  # Return both data and plot if needed
+  list(
+    scenario = scenario,
+    data = weighted_data,
+    plot = plot
+  )
+})
+
+```
+# Hotspot life cycle phases
+
+```{r}
+library(readxl)
+library(tidyverse)
+
+# -------------------------
+# Generalized LCP Hotspot Function
+# -------------------------
+plot_lcp_stacked_all_scenarios <- function(file_path,
+                                           sheet_name = "LCIA RawData",
+                                           indicator,
+                                           output_path = NULL) {
+
+  if (is.null(output_path)) {
+    safe_indicator <- gsub("[^a-zA-Z0-9]", "_", indicator)
+    output_path <- paste0("Figures/stacked_all_LCPs_", safe_indicator, ".png")
+  }
+
+  # Read and process data
+  raw_data <- read_excel(file_path, sheet = sheet_name)
+
+  df <- raw_data %>%
+    mutate(
+      Scenario = factor(Scenario),
+      Indicator = factor(Indicator),
+      Unit = factor(Unit),
+      Quantity = as.numeric(Quantity)
+    )
+
+  # Filter and prepare
+  burdens_df <- df %>%
+    filter(Indicator == indicator, LifeCyclePhase != "Credits")
+
+  # Get data for stacked bars
+  summary_df <- burdens_df %>%
+    group_by(Scenario, LifeCyclePhase) %>%
+    summarise(climate_change = sum(Quantity, na.rm = TRUE), .groups = "drop")
+
+  # Calculate 80% thresholds per scenario
+  thresholds <- burdens_df %>%
+    group_by(Scenario) %>%
+    summarise(
+      total_burden = sum(Quantity, na.rm = TRUE),
+      eighty_percent = 0.8 * total_burden,
+      .groups = "drop"
+    )
+
+  # Merge x positions for geom_segment (ensure matching factor levels)
+  scenario_levels <- levels(summary_df$Scenario)
+
+  thresholds <- thresholds %>%
+    mutate(
+      x = as.numeric(factor(Scenario, levels = scenario_levels)) - 0.4,  # left edge
+      xend = as.numeric(factor(Scenario, levels = scenario_levels)) + 0.4  # right edge
+    )
+
+  # Plot
+  plot <- ggplot(summary_df, aes(x = Scenario, y = climate_change, fill = LifeCyclePhase)) +
+    geom_col(position = "stack") +
+    geom_segment(data = thresholds,
+                 aes(x = x, xend = xend, y = eighty_percent, yend = eighty_percent),
+                 inherit.aes = FALSE,
+                 linetype = "dashed",
+                 color = "black") +
+    geom_text(data = thresholds,
+              aes(x = as.numeric(factor(Scenario)), y = eighty_percent, label = "80%"),
+              inherit.aes = FALSE,
+              vjust = -0.5, size = 3, color = "black") +
+    labs(
+      x = "Scenario",
+      y = paste(indicator, "(EF 3.1)"),
+      fill = "Life Cycle Phase"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "bottom",
+      legend.text = element_text(size = 11)
+    ) +
+    guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+    scale_fill_brewer(
+      palette = "Spectral",
+      labels = c("Manufacture", "Disposal", "Distribution", "Resource Extraction", "Use")
+    )
+
+  # Save
+  ggsave(output_path, plot = plot, bg = "white", width = 10, height = 6)
+
+  return(plot)
+}
+
+
+
+```
+
+## Test
+The most relevant life cycle stages in each scenario are those that contribute cumulatively more than 80% to any impact category (before normalization and weighting).
+
+```{r}
+plot_lcp_stacked_all_scenarios(
+  file_path = "EF_2028f.xlsx",
+  indicator = "Climate change - Total"
+)
+```
+
+
+
+
+
+
+```{r}
+# Step 1: Read full data
+df <- process_data("EF_2028f.xlsx", "LCIA RawData")
+filter_allowed_indicators <- function(df, methodology_used) {
+  # Define valid EF indicators
+  allowed_ef_indicators <- c(
+    "Climate change - Total",
+    "Carcinogenic effects - Total",
+    "Non-carcinogenic effects - Total",
+    "Respiratory effects, inorganics",
+    "Ozone layer depletion",
+    "Photochemical ozone creation",
+    "Ionizing radiation",
+    "Freshwater ecotoxicity - Total",
+    "Freshwater eutrophication",
+    "Marine eutrophiation",
+    "Terrestrial eutrophiation",
+    "Freshwater and terrestrial acidification",
+    "Fossils",
+    "Minerals and metals",
+    "Land use",
+    "Water scarcity"
+  )
+
+  # If using EF, apply the filter
+  if (methodology_used == "Environmental Footprint") {
+    df <- df %>% filter(Indicator %in% allowed_ef_indicators)
+  }
+
+  # For other methods, return df unchanged
+  return(df)
+}
+# Step 1: Read the raw dataset
+df <- process_data("EF_2028f.xlsx", "LCIA RawData")
+
+# Step 2: Apply filtering logic specific to the selected methodology
+relevance_df <- filter_allowed_indicators(df, methodology_used)
+
+# Step 3: Run relevance analysis
+indicators <- unique(relevance_df$Indicator)
+
+relevant_all_indicators <- purrr::map_dfr(indicators, function(ind) {
+  get_relevant_life_cycle_stages(relevance_df, ind)
+}) %>%
+  arrange(Scenario, Indicator)
+
+ft <- relevant_all_indicators %>%
+  flextable() %>%
+  set_header_labels(
+    Scenario = "Scenario",
+    Indicator = "Indicator",
+    LifeCyclePhase = "Life Cycle Phase",
+    total_quantity = "Impact",
+    cum_per = "Cumulative %"
+  ) %>%
+  # Format Impact as scientific with 2 decimal places
+ flextable::colformat_scientific(j = "total_quantity", digits = 2) %>%
+  # Format Cumulative % as normal decimal with 2 decimal places
+  colformat_num(j = "cum_per", digits = 2) %>%
+  autofit() %>%
+  theme_vanilla() %>%
+  set_caption("Most Relevant Life Cycle Phases (≥80%) per Indicator and Scenario")
+
+```
+
+
+
+# Listing out the most relevant life cycle stages in each scenario for a given impact category.
+
+```{r}
+library(dplyr)
+
+get_relevant_life_cycle_stages <- function(df, indicator_name) {
+  df %>%
+    filter(Indicator == indicator_name, LifeCyclePhase != "Credits", !is.na(Quantity)) %>%
+    group_by(Scenario, LifeCyclePhase) %>%
+    summarise(total_quantity = sum(Quantity, na.rm = TRUE), .groups = "drop") %>%
+    group_by(Scenario) %>%
+    arrange(desc(abs(total_quantity))) %>%
+    mutate(
+      total_abs = sum(abs(total_quantity), na.rm = TRUE),
+      cum_sum = cumsum(abs(total_quantity)),
+      cum_per = cum_sum / total_abs,
+      row_num = row_number(),
+      cutoff = which(cum_per >= 0.8)[1],
+      relevant = row_num <= cutoff
+    ) %>%
+    filter(relevant) %>%
+    mutate(Indicator = indicator_name) %>%
+    select(Scenario, Indicator, LifeCyclePhase, total_quantity, cum_per)
+}
+
+
+
+# Example usage
+
+df <- process_data("EF_2028f.xlsx", sheet_name = "LCIA RawData")
+# Get list of all unique indicators
+indicators <- unique(df$Indicator)
+
+# Loop over each and bind results into a single table
+relevant_all_indicators <- purrr::map_dfr(indicators, function(ind) {
+  get_relevant_life_cycle_stages(df, ind)
+})
+
+ggplot(relevant_all_indicators, aes(x = Scenario, y = LifeCyclePhase)) +
+  geom_tile(aes(fill = Indicator)) +
+  facet_wrap(~ Indicator, scales = "free", ncol = 2) +
+  labs(
+    title = "Relevant Life Cycle Phases (≥80%)",
+    x = "Scenario",
+    y = "Life Cycle Phase"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+
